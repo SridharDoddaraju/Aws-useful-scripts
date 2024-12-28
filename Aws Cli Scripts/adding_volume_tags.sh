@@ -31,16 +31,19 @@ for INSTANCE_ID in "${VALID_INSTANCE_IDS[@]}"; do
   echo "Processing instance: $INSTANCE_ID" | tee -a "$LOG_FILE"
 
   # Fetch attached volumes for the instance
-  VOLUME_DETAILS=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].BlockDeviceMappings" --output text)
+  VOLUME_DETAILS=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].BlockDeviceMappings[*].{DeviceName:DeviceName,VolumeId:Ebs.VolumeId}" --output json)
 
   # Check if volumes are attached
-  if [[ -z "$VOLUME_DETAILS" ]]; then
+  if [[ -z "$VOLUME_DETAILS" || "$VOLUME_DETAILS" == "null" ]]; then
     echo "No volumes attached to instance $INSTANCE_ID. Skipping." | tee -a "$LOG_FILE"
     continue
   fi
 
   # Process each attached volume
-  echo "$VOLUME_DETAILS" | while read -r DEVICE_NAME VOLUME_ID; do
+  echo "$VOLUME_DETAILS" | jq -c '.[]' | while read -r VOLUME; do
+    DEVICE_NAME=$(echo "$VOLUME" | jq -r '.DeviceName')
+    VOLUME_ID=$(echo "$VOLUME" | jq -r '.VolumeId')
+
     if [[ -n "$DEVICE_NAME" && -n "$VOLUME_ID" ]]; then
       echo "Adding tags to volume $VOLUME_ID with device name $DEVICE_NAME" | tee -a "$LOG_FILE"
 
@@ -53,7 +56,7 @@ for INSTANCE_ID in "${VALID_INSTANCE_IDS[@]}"; do
       fi
 
       # Add Project_CSI tag to the volume
-      aws ec2 create-tags --resources "$VOLUME_ID" --tags Key=Project_xyz,Value=Yes 2>/dev/null
+      aws ec2 create-tags --resources "$VOLUME_ID" --tags Key=Project_CSI,Value=Yes 2>/dev/null
       if [[ $? -eq 0 ]]; then
         echo "Project_CSI tag added successfully to volume $VOLUME_ID" | tee -a "$LOG_FILE"
       else
@@ -67,5 +70,3 @@ for INSTANCE_ID in "${VALID_INSTANCE_IDS[@]}"; do
 done
 
 echo "Script execution completed. Check $LOG_FILE for details."
-
-
