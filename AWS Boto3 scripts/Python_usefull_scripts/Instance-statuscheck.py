@@ -12,7 +12,7 @@ def get_instance_details(instance_ids):
         return
 
     # Print the header
-    print(f"{'Instance ID':<20}{'Instance Name':<25}{'Private IP':<15}{'State':<15}{'Instance Type':<15}{'Status Checks (3/3)':<20}")
+    print(f"{'Instance ID':<20}{'Instance Name':<25}{'Private IP':<15}{'State':<15}{'Instance Type':<15}{'State Transition Reason':<35}{'Status Checks (3/3)':<20}")
 
     # Process each instance in the response
     for reservation in response.get('Reservations', []):
@@ -21,6 +21,7 @@ def get_instance_details(instance_ids):
             private_ip = instance.get('PrivateIpAddress', 'N/A')
             state = instance.get('State', {}).get('Name', 'N/A')
             instance_type = instance.get('InstanceType', 'N/A')
+            state_transition_reason = instance.get('StateTransitionReason', 'N/A')
 
             # Fetch 'Name' tag if available
             tags = instance.get('Tags', [])
@@ -41,7 +42,7 @@ def get_instance_details(instance_ids):
                 status_checks = f"Error: {e}"
 
             # Format and print each row
-            print(f"{instance_id:<20}{name:<25}{private_ip:<15}{state:<15}{instance_type:<15}{status_checks:<20}")
+            print(f"{instance_id:<20}{name:<25}{private_ip:<15}{state:<15}{instance_type:<15}{state_transition_reason:<35}{status_checks:<20}")
 
 if __name__ == "__main__":
     # Prompt for EC2 instance IDs (comma-separated)
