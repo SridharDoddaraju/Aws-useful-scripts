@@ -1,0 +1,2273 @@
+import boto3
+import pandas as pd
+from datetime import datetime
+import botocore
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ====== CONFIG ======
+# fallback hardcoded mapping (kept for safety if Organizations listing fails)
+account_roles = {
+    "<Account Number>": "Role"
+}
+
+required_tags = [
+    'LifeCycle', 'Tenancy', 'Function', 'Usage', 'Customer',
+    'Environment_Type', 'Environment', 'Budget_Code', 'Grade',
+    'Application', 'Layer', 'Name', 'Service Name', 'Role','ManagedBy','Project','Patch Group','PatchGroup','PendingDeletion'
+]
+
+# role name used across all accounts when assuming role
+ROLE_NAME = "Role"
+# ====================
+
+# Try to populate account_roles dynamically using Organizations
+try:
+    org_client = boto3.client("organizations")
+    accounts = []
+    paginator = org_client.get_paginator("list_accounts")
+    for page in paginator.paginate():
+        for acct in page.get("Accounts", []):
+            if acct.get("Status") == "ACTIVE":
+                accounts.append(acct.get("Id"))
+    if accounts:
+        account_roles = {acct_id: ROLE_NAME for acct_id in accounts}
+        print(f"[INFO] Populated {len(accounts)} accounts from Organizations")
+    else:
+        print("[WARN] Organizations returned no active accounts; using hardcoded account_roles")
+except botocore.exceptions.ClientError as e:
+    print(f"[WARN] Could not list accounts via Organizations (will use hardcoded account_roles): {e}")
+except Exception as e:
+    print(f"[WARN] Unexpected error while listing accounts (using hardcoded account_roles): {e}")
+
+def assume_role(account_id, role_name):
+    sts = boto3.client("sts")
+    creds = sts.assume_role(
+        RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
+        RoleSessionName="InventorySession"
+    )["Credentials"]
+
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"]
+    )
+
+# ----------------- Helpers -----------------
+def get_all_regions(session):
+    """
+    Return list of region names for this partition, including opt-in regions
+    that are either 'opt-in-not-required' or 'opted-in'.
+    """
+    ec2 = session.client("ec2")
+    try:
+        resp = ec2.describe_regions(AllRegions=True)
+        regions = []
+        for r in resp.get("Regions", []):
+            optin = r.get("OptInStatus", "opt-in-not-required")
+            # include regions that are available or opted-in
+            if optin in ("opt-in-not-required", "opted-in"):
+                regions.append(r["RegionName"])
+        return sorted(regions)
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] describe_regions failed: {e}")
+        # fallback to a safe common regions list if describe_regions fails
+        return ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "af-south-1", "ap-east-1", "ap-south-1", "ap-south-2",
+"ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+"ca-central-1", "ca-west-1", "eu-central-1", "eu-central-2", "eu-west-1", "eu-west-2", "eu-west-3", "eu-south-1", "eu-south-2" "me-south-1", "me-central-1", "sa-east-1", "il-central-1",
+ "us-gov-east-1", "us-gov-west-1", "cn-north-1", "cn-northwest-1"]
+
+def safe_paginate(client, operation_name, **kwargs):
+    """
+    Utility to use paginator if available, otherwise call operation once.
+    Returns an iterator of pages (dict).
+    """
+    try:
+        paginator = client.get_paginator(operation_name)
+        return paginator.paginate(**kwargs)
+    except (botocore.exceptions.OperationNotPageableError, botocore.exceptions.ClientError):
+        # operation not pageable or client error: do a single call and wrap in list
+        try:
+            fn = getattr(client, operation_name)
+            return [fn(**kwargs)]
+        except Exception as e:
+            raise
+
+# ----------------- Collector Functions (fixed pagination + logging) -----------------
+#------------EC2
+def collect_ec2(session, region, account_id):
+    print(f"[START] EC2 collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        iam_client = session.client("iam", region_name=region)
+        rows = []
+
+        # Collect all volumes once with paginator
+        volume_info = {}
+        try:
+            pages = safe_paginate(client, "describe_volumes")
+            for page in pages:
+                for v in page.get("Volumes", []):
+                    volume_info[v["VolumeId"]] = {
+                        "Size": v.get("Size"),
+                        "VolumeType": v.get("VolumeType", ""),
+                        "Encrypted": v.get("Encrypted", False)
+                    }
+        except Exception as e:
+            print(f"[WARN] Could not fetch all EBS volumes for {account_id}/{region}: {e}")
+
+        # Pre-fetch subnet and VPC names for lookup
+        subnet_names = {}
+        vpc_names = {}
+        try:
+            subnets = safe_paginate(client, "describe_subnets")
+            for page in subnets:
+                for s in page.get("Subnets", []):
+                    name_tag = ""
+                    for t in s.get("Tags", []):
+                        if t["Key"].lower() == "name":
+                            name_tag = t["Value"]
+                            break
+                    subnet_names[s["SubnetId"]] = name_tag
+
+            vpcs = safe_paginate(client, "describe_vpcs")
+            for page in vpcs:
+                for v in page.get("Vpcs", []):
+                    name_tag = ""
+                    for t in v.get("Tags", []):
+                        if t["Key"].lower() == "name":
+                            name_tag = t["Value"]
+                            break
+                    vpc_names[v["VpcId"]] = name_tag
+        except Exception as e:
+            print(f"[WARN] Could not fetch VPC/Subnet names for {account_id}/{region}: {e}")
+
+        # Use paginator for instances
+        try:
+            pages = safe_paginate(client, "describe_instances")
+            for page in pages:
+                for r in page.get("Reservations", []):
+                    for i in r.get("Instances", []):
+                        # Tags
+                        tags = {t["Key"]: t["Value"] for t in i.get("Tags", []) if t["Key"] in required_tags}
+
+                        # Attached volumes
+                        volumes = i.get("BlockDeviceMappings", [])
+                        volume_ids = [v["Ebs"]["VolumeId"] for v in volumes if "Ebs" in v and v["Ebs"].get("VolumeId")]
+                        volume_sizes = [str(volume_info[v]["Size"]) if v in volume_info and volume_info[v].get("Size") is not None else "" for v in volume_ids]
+                        volume_types = [volume_info[v]["VolumeType"] if v in volume_info else "" for v in volume_ids]
+                        volume_encrypted = [str(volume_info[v]["Encrypted"]) if v in volume_info else "" for v in volume_ids]
+
+                        # Network info
+                        vpc_id = i.get("VpcId", "")
+                        subnet_id = i.get("SubnetId", "")
+                        vpc_name = vpc_names.get(vpc_id, "")
+                        subnet_name = subnet_names.get(subnet_id, "")
+
+                        # Security Groups
+                        sg_info = i.get("SecurityGroups", [])
+                        sg_ids = [sg.get("GroupId", "") for sg in sg_info]
+                        sg_names = [sg.get("GroupName", "") for sg in sg_info]
+
+                        # IAM Role
+                        iam_role_name = ""
+                        iam_role_arn = ""
+                        if "IamInstanceProfile" in i and i["IamInstanceProfile"]:
+                            profile_arn = i["IamInstanceProfile"].get("Arn", "")
+                            try:
+                                profile_name = profile_arn.split("/")[-1]
+                                resp = iam_client.get_instance_profile(InstanceProfileName=profile_name)
+                                roles = resp["InstanceProfile"].get("Roles", [])
+                                if roles:
+                                    iam_role_name = roles[0]["RoleName"]
+                                    iam_role_arn = roles[0]["Arn"]
+                            except Exception:
+                                iam_role_name = profile_arn.split("/")[-1]
+
+                        row = {
+                            "Service": "EC2",
+                            "Account": account_id,
+                            "Region": region,
+                            "Instance ID": i["InstanceId"],
+                            "AZ": i.get("Placement", {}).get("AvailabilityZone", ""),
+                            "State": i.get("State", {}).get("Name", ""),
+                            "Private IP": i.get("PrivateIpAddress", ""),
+                            "Public IP": i.get("PublicIpAddress", ""),
+                            "Launchdate": i.get("LaunchTime").strftime("%Y-%m-%d %H:%M:%S") if i.get("LaunchTime") else "",
+                            "State Transition Reason": i.get("StateTransitionReason", ""),
+                            "Instance Type": i.get("InstanceType", ""),
+                            "OS": i.get("Platform", "Linux/UNIX"),
+                            "KeyName": i.get("KeyName", ""),
+
+                            # Volumes
+                            "Volume IDs": ";".join(volume_ids),
+                            "Volume Sizes": ";".join(volume_sizes),
+                            "Volume Type": ";".join(volume_types),
+                            "Encrypted": ";".join(volume_encrypted),
+
+                            # Network attachments
+                            "VPC ID": vpc_id,
+                            "VPC Name": vpc_name,
+                            "Subnet ID": subnet_id,
+                            "Subnet Name": subnet_name,
+                            "Security Group IDs": ";".join(sg_ids),
+                            "Security Group Names": ";".join(sg_names),
+
+                            # IAM Role
+                            "IAM Role Name": iam_role_name,
+                            "IAM Role ARN": iam_role_arn,
+
+                            **{tag: tags.get(tag, "") for tag in required_tags}
+                        }
+
+                        rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_instances failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected EC2 processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] EC2 collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] EC2 collection failed in {region} for {account_id}: {e}")
+        return []
+
+
+#####EBS############
+def collect_ebs(session, region, account_id):
+    print(f"[START] EBS collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+        try:
+            pages = safe_paginate(client, "describe_volumes")
+            for page in pages:
+                for v in page.get("Volumes", []):
+                    tags = {t["Key"]: t["Value"] for t in v.get("Tags", []) if t["Key"] in required_tags}
+
+                    # Defaults
+                    instance_id = ""
+                    device = ""
+
+                    # If volume is attached to an instance
+                    if v.get("Attachments"):
+                        att = v["Attachments"][0]
+                        instance_id = att.get("InstanceId", "")
+                        device = att.get("Device", "")
+
+                    row = {
+                        "Service": "EBS",
+                        "Account": account_id,
+                        "Region": region,
+                        "VolumeId": v.get("VolumeId", ""),
+                        "Instance ID": instance_id,
+                        "Device": device,
+                        "Size": v.get("Size", ""),
+                        "VolumeType": v.get("VolumeType", ""),
+                        "Encrypted": "Yes" if v.get("Encrypted") else "No",
+                        "IOPS": v.get("Iops", ""),
+                        "Throughput": v.get("Throughput", ""),
+                        "SnapshotId": v.get("SnapshotId", ""),
+                        "CreateTime": v.get("CreateTime").strftime("%Y-%m-%d %H:%M:%S") if v.get("CreateTime") else "",
+                        "EBS Status": v.get("State", ""),
+                        "KMS Key ID": v.get("KmsKeyId", ""),
+                        "KMS Key Type": (
+                            "Customer Managed" if v.get("KmsKeyId", "").startswith("arn:aws:kms")
+                            else ("AWS Managed" if v.get("KmsKeyId") else "")
+                        ),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_volumes failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected EBS processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] EBS collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] EBS collection failed in {region} for {account_id}: {e}")
+        return []
+
+################RDS###############
+def collect_rds(session, region, account_id):
+    print(f"[START] RDS collection for {account_id}/{region}")
+    try:
+        client = session.client("rds", region_name=region)
+        rows = []
+        try:
+            pages = safe_paginate(client, "describe_db_instances")
+            for page in pages:
+                for db in page.get("DBInstances", []):
+                    tags_resp = {}
+                    try:
+                        tags_list = client.list_tags_for_resource(ResourceName=db["DBInstanceArn"]).get("TagList", [])
+                        tags_resp = {t["Key"]: t["Value"] for t in tags_list if t["Key"] in required_tags}
+                    except botocore.exceptions.ClientError:
+                        pass
+                    row = {
+                        "Service": "RDS",
+                        "Account": account_id,
+                        "Region": region,
+                        "DBInstanceIdentifier": db.get("DBInstanceIdentifier", ""),
+                        "DBInstanceClass": db.get("DBInstanceClass", ""),
+                        "Engine": db.get("Engine", ""),
+                        "DBInstanceStatus": db.get("DBInstanceStatus", ""),
+                        **{tag: tags_resp.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_db_instances failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected RDS processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] RDS collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] RDS collection failed in {region} for {account_id}: {e}")
+        return []
+
+def collect_s3(session, region, account_id):
+    print(f"[START] S3 collection for {account_id}")
+    try:
+        client = session.client("s3")
+        buckets = client.list_buckets().get("Buckets", [])
+        rows = []
+        for bucket in buckets:
+            try:
+                tags_resp = client.get_bucket_tagging(Bucket=bucket["Name"]).get("TagSet", [])
+                tags = {t["Key"]: t["Value"] for t in tags_resp if t["Key"] in required_tags}
+            except botocore.exceptions.ClientError:
+                tags = {}
+            row = {
+                "Service": "S3",
+                "Account": account_id,
+                "Region": "Global",
+                "BucketName": bucket.get("Name", ""),
+                "CreationDate": bucket.get("CreationDate").strftime("%Y-%m-%d %H:%M:%S") if bucket.get("CreationDate") else "",
+                **{tag: tags.get(tag, "") for tag in required_tags}
+            }
+            rows.append(row)
+        print(f"[DONE] S3 collection for {account_id} - {len(rows)} records")
+        return rows
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] S3 collection failed for {account_id}: {e}")
+        return []
+
+def collect_lambda(session, region, account_id):
+    print(f"[START] Lambda collection for {account_id}/{region}")
+    try:
+        client = session.client("lambda", region_name=region)
+        rows = []
+        try:
+            pages = safe_paginate(client, "list_functions")
+            for page in pages:
+                for fn in page.get("Functions", []):
+                    try:
+                        tags_resp = client.list_tags(Resource=fn["FunctionArn"])
+                        tags = {t: v for t, v in tags_resp.get("Tags", {}).items() if t in required_tags}
+                    except botocore.exceptions.ClientError:
+                        tags = {}
+                    row = {
+                        "Service": "Lambda",
+                        "Account": account_id,
+                        "Region": region,
+                        "FunctionName": fn.get("FunctionName", ""),
+                        "Runtime": fn.get("Runtime", ""),
+                        "Handler": fn.get("Handler", ""),
+                        "State": fn.get("State", ""),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] list_functions failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected Lambda processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] Lambda collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] Lambda collection failed in {region} for {account_id}: {e}")
+        return []
+#--------------------ELB-----------------------------------
+def collect_elb(session, region, account_id):
+    print(f"[START] ELB collection for {account_id}/{region}")
+    rows = []
+    try:
+        client = session.client("elb", region_name=region)
+        try:
+            pages = safe_paginate(client, "describe_load_balancers")
+            for page in pages:
+                for lb in page.get("LoadBalancerDescriptions", []):
+                    try:
+                        tags_list = client.describe_tags(LoadBalancerNames=[lb["LoadBalancerName"]]).get("TagDescriptions", [])
+                        tags = {t["Key"]: t["Value"] for tds in tags_list for t in tds.get("Tags", []) if t["Key"] in required_tags}
+                    except botocore.exceptions.ClientError:
+                        tags = {}
+                    row = {
+                        "Service": "ELB",
+                        "Account": account_id,
+                        "Region": region,
+                        "LoadBalancerName": lb.get("LoadBalancerName", ""),
+                        "DNSName": lb.get("DNSName", ""),
+                        "Scheme": lb.get("Scheme", ""),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_load_balancers failed for {account_id}/{region}: {e}")
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] ELB client creation failed for {account_id}/{region}: {e}")
+
+    print(f"[DONE] ELB collection for {account_id}/{region} - {len(rows)} records")
+    return rows
+
+def collect_alb(session, region, account_id):
+    print(f"[START] ALB collection for {account_id}/{region}")
+    rows = []
+    try:
+        client = session.client("elbv2", region_name=region)
+        try:
+            pages = safe_paginate(client, "describe_load_balancers")
+            for page in pages:
+                for lb in page.get("LoadBalancers", []):
+                    try:
+                        tags_list = client.describe_tags(ResourceArns=[lb["LoadBalancerArn"]]).get("TagDescriptions", [])
+                        tags = {t["Key"]: t["Value"] for td in tags_list for t in td.get("Tags", []) if t["Key"] in required_tags}
+                    except botocore.exceptions.ClientError:
+                        tags = {}
+                    row = {
+                        "Service": "ALB",
+                        "Account": account_id,
+                        "Region": region,
+                        "LoadBalancerName": lb.get("LoadBalancerName", ""),
+                        "DNSName": lb.get("DNSName", ""),
+                        "Scheme": lb.get("Scheme", ""),
+                        "Type": lb.get("Type", ""),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_load_balancers (elbv2) failed for {account_id}/{region}: {e}")
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] ALB client creation failed for {account_id}/{region}: {e}")
+
+    print(f"[DONE] ALB collection for {account_id}/{region} - {len(rows)} records")
+    return rows
+
+#--------------------EFS-------
+def collect_efs(session, region, account_id):
+    print(f"[START] EFS collection for {account_id}/{region}")
+    try:
+        client = session.client("efs", region_name=region)
+        rows = []
+        try:
+            pages = safe_paginate(client, "describe_file_systems")
+            for page in pages:
+                for fs in page.get("FileSystems", []):
+                    tags = {t["Key"]: t["Value"] for t in fs.get("Tags", []) if t["Key"] in required_tags}
+
+                    # Collect mount targets
+                    mount_targets = []
+                    try:
+                        mt_resp = client.describe_mount_targets(FileSystemId=fs["FileSystemId"])
+                        for mt in mt_resp.get("MountTargets", []):
+                            mount_targets.append(f"{mt.get('MountTargetId')} ({mt.get('SubnetId')}/{mt.get('LifeCycleState')})")
+                    except Exception as e:
+                        print(f"   [WARN] Could not fetch mount targets for {fs.get('FileSystemId')}: {e}")
+
+                    row = {
+                        "Service": "EFS",
+                        "Account": account_id,
+                        "Region": region,
+                        "FileSystemId": fs.get("FileSystemId", ""),
+                        "PerformanceMode": fs.get("PerformanceMode", ""),
+                        "ThroughputMode": fs.get("ThroughputMode", ""),
+                        "ProvisionedThroughputInMibps": fs.get("ProvisionedThroughputInMibps", ""),
+                        "Encrypted": "Yes" if fs.get("Encrypted", False) else "No",
+                        "KMS Key ID": fs.get("KmsKeyId", ""),
+                        "LifeCycleState": fs.get("LifeCycleState", ""),
+                        "CreationTime": fs.get("CreationTime").strftime("%Y-%m-%d %H:%M:%S") if fs.get("CreationTime") else "",
+                        "NumberOfMountTargets": fs.get("NumberOfMountTargets", ""),
+                        "SizeInBytes": fs.get("SizeInBytes", {}).get("Value", "") if fs.get("SizeInBytes") else "",
+                        "SizeInBytes_Timestamp": fs.get("SizeInBytes", {}).get("Timestamp").strftime("%Y-%m-%d %H:%M:%S") if fs.get("SizeInBytes") and fs.get("SizeInBytes").get("Timestamp") else "",
+                        "MountTargets": "; ".join(mount_targets),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_file_systems failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected EFS processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] EFS collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] EFS collection failed in {region} for {account_id}: {e}")
+        return []
+
+#-------------------------EKS---------------
+def collect_eks(session, region, account_id):
+    print(f"[START] EKS collection for {account_id}/{region}")
+    try:
+        client = session.client("eks", region_name=region)
+
+        # List clusters
+        rows = []
+        try:
+            pages = safe_paginate(client, "list_clusters")
+            cluster_names = []
+            for page in pages:
+                cluster_names.extend(page.get("clusters", []))
+
+            for cname in cluster_names:
+                try:
+                    resp = client.describe_cluster(name=cname)
+                    cluster = resp.get("cluster", {})
+
+                    tags = {k: v for k, v in cluster.get("tags", {}).items() if k in required_tags}
+
+                    # Encryption config
+                    kms_key = ""
+                    if cluster.get("encryptionConfig"):
+                        for enc in cluster["encryptionConfig"]:
+                            kms_key = enc.get("provider", {}).get("keyArn", "")
+
+                    row = {
+                        "Service": "EKS",
+                        "Account": account_id,
+                        "Region": region,
+                        "ClusterName": cluster.get("name", ""),
+                        "ClusterArn": cluster.get("arn", ""),
+                        "Version": cluster.get("version", ""),
+                        "Status": cluster.get("status", ""),
+                        "PlatformVersion": cluster.get("platformVersion", ""),
+                       # "Endpoint": cluster.get("endpoint", ""),
+                        "RoleArn": cluster.get("roleArn", ""),
+                        "VpcId": cluster.get("resourcesVpcConfig", {}).get("vpcId", ""),
+                        "SubnetIds": ";".join(cluster.get("resourcesVpcConfig", {}).get("subnetIds", [])),
+                        "SecurityGroups": ";".join(cluster.get("resourcesVpcConfig", {}).get("securityGroupIds", [])),
+                        "KMS Key ID": kms_key,
+                        "CreatedAt": cluster.get("createdAt").strftime("%Y-%m-%d %H:%M:%S") if cluster.get("createdAt") else "",
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+                except Exception as e:
+                    print(f"   [WARN] Could not describe cluster {cname} for {account_id}/{region}: {e}")
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] list_clusters failed for {account_id}/{region}: {e}")
+
+        print(f"[DONE] EKS collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] EKS collection failed in {region} for {account_id}: {e}")
+        return []
+
+#-----ebs-Snapshot-------
+def collect_ebs_snapshots(session, region, account_id):
+    print(f"[START] EBS Snapshots collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+        try:
+            paginator = client.get_paginator("describe_snapshots")
+            for page in paginator.paginate(OwnerIds=["self"]):
+                for snap in page.get("Snapshots", []):
+                    tags = {t["Key"]: t["Value"] for t in snap.get("Tags", []) if t["Key"] in required_tags}
+
+                    row = {
+                        "Service": "EBS Snapshot",
+                        "Account": account_id,
+                        "Region": region,
+                        "SnapshotId": snap.get("SnapshotId", ""),
+                        "VolumeId": snap.get("VolumeId", ""),
+                        "State": snap.get("State", ""),
+                        "Description": snap.get("Description", ""),
+                        "Encrypted": "Yes" if snap.get("Encrypted", False) else "No",
+                        "KMS Key ID": snap.get("KmsKeyId", ""),
+                        "VolumeSize": snap.get("VolumeSize", ""),
+                        "StartTime": snap.get("StartTime").strftime("%Y-%m-%d %H:%M:%S") if snap.get("StartTime") else "",
+                        "OwnerId": snap.get("OwnerId", ""),
+                        "Progress": snap.get("Progress", ""),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_snapshots failed for {account_id}/{region}: {e}")
+
+        print(f"[DONE] EBS Snapshots collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] EBS Snapshots collection failed in {region} for {account_id}: {e}")
+        return []
+
+#-------------------VPC-------
+def collect_vpcs(session, region, account_id):
+    print(f"[START] VPC collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+
+        try:
+            pages = safe_paginate(client, "describe_vpcs")
+            # fetch all flow logs in region (paginates)
+            flow_logs_map = {}
+            try:
+                fl_pages = safe_paginate(client, "describe_flow_logs")
+                for fl_page in fl_pages:
+                    for fl in fl_page.get("FlowLogs", []):
+                        if fl.get("ResourceType") == "VPC":
+                            flow_logs_map.setdefault(fl.get("ResourceId"), []).append(fl)
+            except Exception:
+                # non-fatal
+                flow_logs_map = {}
+
+            for page in pages:
+                for vpc in page.get("Vpcs", []):
+                    tags = {t["Key"]: t["Value"] for t in vpc.get("Tags", []) if t["Key"] in required_tags}
+
+                    is_default = vpc.get("IsDefault", False)
+                    cidr_blocks = ";".join([assoc.get("CidrBlock", "") for assoc in vpc.get("CidrBlockAssociationSet", [])])
+                    ipv6_cidrs = ";".join([assoc.get("Ipv6CidrBlock", "") for assoc in vpc.get("Ipv6CidrBlockAssociationSet", [])])
+
+                    # Check if flow logs exist for this VPC
+                    flow_logs_enabled = "Yes" if vpc.get("VpcId") in flow_logs_map else "No"
+
+                    row = {
+                        "Service": "VPC",
+                        "Account": account_id,
+                        "Region": region,
+                        "VpcId": vpc.get("VpcId", ""),
+                        "State": vpc.get("State", ""),
+                        "IsDefault": "Yes" if is_default else "No",
+                        "CidrBlocks": cidr_blocks,
+                        "Ipv6CidrBlocks": ipv6_cidrs,
+                        "DhcpOptionsId": vpc.get("DhcpOptionsId", ""),
+                        "InstanceTenancy": vpc.get("InstanceTenancy", ""),
+                        "OwnerId": vpc.get("OwnerId", ""),
+                        "FlowLogsEnabled": flow_logs_enabled,
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_vpcs failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected VPC processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] VPC collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] VPC collection failed in {region} for {account_id}: {e}")
+        return []
+
+#-----------subnets--------------
+def collect_subnets(session, region, account_id):
+    print(f"[START] Subnet collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+        try:
+            pages = safe_paginate(client, "describe_subnets")
+
+            # fetch flow logs for subnets
+            try:
+                fl_pages = safe_paginate(client, "describe_flow_logs")
+                subnet_flowlog_map = {fl.get("ResourceId"): fl for fl_page in fl_pages for fl in fl_page.get("FlowLogs", []) if fl.get("ResourceType") == "Subnet"}
+            except Exception:
+                subnet_flowlog_map = {}
+
+            # fetch route tables (single call but uses paginator if available)
+            rt_map = {}
+            try:
+                rt_pages = safe_paginate(client, "describe_route_tables")
+                for rt_page in rt_pages:
+                    for rt in rt_page.get("RouteTables", []):
+                        for assoc in rt.get("Associations", []):
+                            if assoc.get("SubnetId"):
+                                rt_map[assoc["SubnetId"]] = rt
+            except Exception:
+                rt_map = {}
+
+            for page in pages:
+                for subnet in page.get("Subnets", []):
+                    tags = {t["Key"]: t["Value"] for t in subnet.get("Tags", []) if t["Key"] in required_tags}
+
+                    flow_logs_enabled = "Yes" if subnet.get("SubnetId") in subnet_flowlog_map else "No"
+
+                    # determine if subnet is public or private
+                    subnet_type = "Private"
+                    rt = rt_map.get(subnet.get("SubnetId"))
+                    if rt:
+                        for route in rt.get("Routes", []):
+                            if route.get("GatewayId", "").startswith("igw-") and route.get("State") == "active":
+                                subnet_type = "Public"
+                                break
+
+                    row = {
+                        "Service": "Subnet",
+                        "Account": account_id,
+                        "Region": region,
+                        "SubnetId": subnet.get("SubnetId", ""),
+                        "SubnetType": subnet_type,
+                        "VpcId": subnet.get("VpcId", ""),
+                        "CidrBlock": subnet.get("CidrBlock", ""),
+                        "Ipv6CidrBlockAssociationSet": ";".join([a.get("Ipv6CidrBlock", "") for a in subnet.get("Ipv6CidrBlockAssociationSet", [])]),
+                        "AvailabilityZone": subnet.get("AvailabilityZone", ""),
+                        "AvailabilityZoneId": subnet.get("AvailabilityZoneId", ""),
+                        "State": subnet.get("State", ""),
+                        "DefaultForAz": "Yes" if subnet.get("DefaultForAz", False) else "No",
+                        "MapPublicIpOnLaunch": "Yes" if subnet.get("MapPublicIpOnLaunch", False) else "No",
+                        "AssignIpv6OnCreate": "Yes" if subnet.get("AssignIpv6AddressOnCreation", False) else "No",
+                        "OwnerId": subnet.get("OwnerId", ""),
+                        "FlowLogsEnabled": flow_logs_enabled,
+                        "AvailableIpAddressCount": subnet.get("AvailableIpAddressCount", ""),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_subnets failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected Subnet processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] Subnet collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] Subnet collection failed in {region} for {account_id}: {e}")
+        return []
+
+#--------IGW-----------
+def collect_internet_gateways(session, region, account_id):
+    print(f"[START] Internet Gateway collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+        try:
+            igw_pages = safe_paginate(client, "describe_internet_gateways")
+            rt_pages = safe_paginate(client, "describe_route_tables")
+
+            rt_list = []
+            for rt_page in rt_pages:
+                rt_list.extend(rt_page.get("RouteTables", []))
+
+            for igw_page in igw_pages:
+                for igw in igw_page.get("InternetGateways", []):
+                    tags = {t["Key"]: t["Value"] for t in igw.get("Tags", []) if t["Key"] in required_tags}
+
+                    attachments = igw.get("Attachments", [])
+                    vpc_ids = [att.get("VpcId") for att in attachments if att.get("VpcId")]
+                    states = [att.get("State", "") for att in attachments]
+
+                    associated_subnets = []
+                    for rt in rt_list:
+                        for route in rt.get("Routes", []):
+                            if route.get("GatewayId") == igw.get("InternetGatewayId") and route.get("State") == "active":
+                                for assoc in rt.get("Associations", []):
+                                    if assoc.get("SubnetId"):
+                                        associated_subnets.append(assoc.get("SubnetId"))
+                                if not rt.get("Associations"):
+                                    associated_subnets.append("ALL_SUBNETS_IN_VPC")
+
+                    row = {
+                        "Service": "InternetGateway",
+                        "Account": account_id,
+                        "Region": region,
+                        "InternetGatewayId": igw.get("InternetGatewayId", ""),
+                        "VpcIds": ";".join(vpc_ids) if vpc_ids else "",
+                        "AttachmentState": ";".join(states) if states else "Detached",
+                        "AssociatedSubnets": ";".join(associated_subnets) if associated_subnets else "",
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_internet_gateways or describe_route_tables failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected IGW processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] Internet Gateway collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] Internet Gateway collection failed in {region} for {account_id}: {e}")
+        return []
+
+#------------------AMI---------------------------------------
+def collect_amis(session, region, account_id):
+    print(f"[START] AMI collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+        try:
+            paginator = client.get_paginator("describe_images")
+            response_iterator = paginator.paginate(Owners=["self"])
+            for page in response_iterator:
+                for ami in page.get("Images", []):
+                    tags = {t["Key"]: t["Value"] for t in ami.get("Tags", []) if t["Key"] in required_tags}
+
+                    row = {
+                        "Service": "AMI",
+                        "Account": account_id,
+                        "Region": region,
+                        "ImageId": ami.get("ImageId", ""),
+                        "Name": ami.get("Name", ""),
+                        "Description": ami.get("Description", ""),
+                        "State": ami.get("State", ""),
+                        "ImageType": ami.get("ImageType", ""),
+                        "PlatformDetails": ami.get("PlatformDetails", ""),
+                        "Architecture": ami.get("Architecture", ""),
+                        "VirtualizationType": ami.get("VirtualizationType", ""),
+                        "RootDeviceName": ami.get("RootDeviceName", ""),
+                        "RootDeviceType": ami.get("RootDeviceType", ""),
+                        "EnaSupport": "Yes" if ami.get("EnaSupport", False) else "No",
+                        "SriovNetSupport": ami.get("SriovNetSupport", ""),
+                        "CreationDate": ami.get("CreationDate", ""),
+                        "OwnerId": ami.get("OwnerId", ""),
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_images failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected AMI processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] AMI collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] AMI collection failed in {region} for {account_id}: {e}")
+        return []
+
+#--------EIp------------------------------
+def collect_eips(session, region, account_id):
+    print(f"[START] EIP collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+        try:
+            pages = safe_paginate(client, "describe_addresses")
+            for page in pages:
+                for eip in page.get("Addresses", []):
+                    tags = {t["Key"]: t["Value"] for t in eip.get("Tags", []) if t["Key"] in required_tags}
+
+                    row = {
+                        "Service": "ElasticIP",
+                        "Account": account_id,
+                        "Region": region,
+                        "Public IP": eip.get("PublicIp", ""),
+                        "AllocationId": eip.get("AllocationId", ""),
+                        "AssociationId": eip.get("AssociationId", ""),
+                        "Private IP": eip.get("PrivateIpAddress", ""),
+                        "Instance ID": eip.get("InstanceId", ""),
+                        "NetworkInterfaceId": eip.get("NetworkInterfaceId", ""),
+                        "Domain": eip.get("Domain", ""),  # 'vpc' or 'standard'
+                        "NetworkBorderGroup": eip.get("NetworkBorderGroup", ""),
+                        "CarrierIp": eip.get("CarrierIp", ""),
+                        "PublicIpv4Pool": eip.get("PublicIpv4Pool", ""),
+                        "InUse": "Yes" if eip.get("AssociationId") else "No",
+                        **{tag: tags.get(tag, "") for tag in required_tags}
+                    }
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] describe_addresses failed for {account_id}/{region}: {e}")
+
+        print(f"[DONE] EIP collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] EIP collection failed in {region} for {account_id}: {e}")
+        return []
+
+#------------------------SG-----------------------------------------------
+def collect_security_groups(session, region, account_id):
+    """
+    Collect Security Groups info with attached resources and rule summaries.
+    Outputs separate ResourceName and ResourceId columns.
+    """
+    print(f"[START] Security Groups collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+        rows = []
+
+        try:
+            sgs_pages = safe_paginate(client, "describe_security_groups")
+            enis_pages = safe_paginate(client, "describe_network_interfaces")
+
+            # Map SG -> list of attached instance IDs
+            sg_to_instances = {}
+            instance_ids_set = set()
+            for enis_page in enis_pages:
+                for eni in enis_page.get("NetworkInterfaces", []):
+                    for sg in eni.get("Groups", []):
+                        sg_id = sg.get("GroupId")
+                        inst_id = eni.get("Attachment", {}).get("InstanceId")
+                        if sg_id:
+                            sg_to_instances.setdefault(sg_id, [])
+                            if inst_id:
+                                sg_to_instances[sg_id].append(inst_id)
+                                instance_ids_set.add(inst_id)
+
+            # Optional: map instance IDs -> Names
+            instance_name_map = {}
+            if instance_ids_set:
+                ec2 = session.client("ec2", region_name=region)
+                try:
+                    inst_pages = safe_paginate(ec2, "describe_instances", InstanceIds=list(instance_ids_set))
+                    for inst_page in inst_pages:
+                        for r in inst_page.get("Reservations", []):
+                            for i in r.get("Instances", []):
+                                name_tag = next((t["Value"] for t in i.get("Tags", []) if t["Key"] == "Name"), "")
+                                instance_name_map[i.get("InstanceId")] = name_tag
+                except Exception:
+                    # if instance lookup fails, continue with empty names
+                    pass
+
+            for sgs_page in sgs_pages:
+                for sg in sgs_page.get("SecurityGroups", []):
+                    # Tags
+                    tags = {t["Key"]: t["Value"] for t in sg.get("Tags", []) if t["Key"] in required_tags}
+
+                    # Attached resources (split into two columns)
+                    attached_names = []
+                    attached_ids = []
+                    for inst_id in sg_to_instances.get(sg.get("GroupId"), []):
+                        name = instance_name_map.get(inst_id, "")
+                        if name:
+                            attached_names.append(name)
+                        attached_ids.append(inst_id)
+
+                    in_use = bool(attached_ids)
+
+                    # Ingress rules summary
+                    ingress_rules = []
+                    for rule in sg.get("IpPermissions", []):
+                        from_port = str(rule.get("FromPort", "-"))
+                        to_port = str(rule.get("ToPort", "-"))
+                        protocol = rule.get("IpProtocol", "-")
+                        for ipr in rule.get("IpRanges", []):
+                            cidr = ipr.get("CidrIp", "")
+                            ingress_rules.append(f"{protocol}:{from_port}-{to_port} | {cidr}")
+
+                    # Egress rules summary
+                    egress_rules = []
+                    for rule in sg.get("IpPermissionsEgress", []):
+                        from_port = str(rule.get("FromPort", "-"))
+                        to_port = str(rule.get("ToPort", "-"))
+                        protocol = rule.get("IpProtocol", "-")
+                        for ipr in rule.get("IpRanges", []):
+                            cidr = ipr.get("CidrIp", "")
+                            egress_rules.append(f"{protocol}:{from_port}-{to_port} | {cidr}")
+
+                    # Check if any rule allows 0.0.0.0/0
+                    all_traffic_anywhere = any("0.0.0.0/0" in r for r in ingress_rules + egress_rules)
+
+                    row = {
+                        "Service": "SecurityGroup",
+                        "Account": account_id,
+                        "Region": region,
+                        "GroupId": sg.get("GroupId", ""),
+                        "GroupName": sg.get("GroupName", ""),
+                        "VpcId": sg.get("VpcId", ""),
+                        "Description": sg.get("Description", ""),
+                        "ResourceName": ", ".join(attached_names) if attached_names else "None",
+                        "ResourceId": ", ".join(attached_ids) if attached_ids else "None",
+                        "InUse": in_use,
+                        "IngressRules": "; ".join(ingress_rules) if ingress_rules else "-",
+                        "EgressRules": "; ".join(egress_rules) if egress_rules else "-",
+                        "AllTrafficFromAnywhere": all_traffic_anywhere,
+                        **{t: tags.get(t, "") for t in required_tags},
+                    }
+
+                    rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            print(f"[ERROR] Security Groups / ENIs retrieval failed for {account_id}/{region}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected Security Groups processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] Security Groups collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] Security Groups collection failed in {region} for {account_id}: {e}")
+        return []
+
+#----------------------Workspace--------------------------
+def collect_workspaces(session, region, account_id):
+    print(f"[START] WorkSpaces collection for {account_id}/{region}")
+    try:
+        client = session.client("workspaces", region_name=region)
+        rows = []
+        try:
+            response = client.describe_workspaces()
+            workspaces = response.get("Workspaces", [])
+
+            # Pagination handling
+            while response.get("NextToken"):
+                response = client.describe_workspaces(NextToken=response["NextToken"])
+                workspaces.extend(response.get("Workspaces", []))
+
+            for ws in workspaces:
+                workspace_id = ws.get("WorkspaceId", "")
+                directory_id = ws.get("DirectoryId", "")
+                user_name = ws.get("UserName", "")
+                bundle_id = ws.get("BundleId", "")
+                state = ws.get("State", "")
+                computer_name = ws.get("ComputerName", "")
+                ip_address = ws.get("IpAddress", "")
+                subnet_id = ws.get("SubnetId", "")
+                volume_encryption = ws.get("VolumeEncryptionKey", "")
+                root_volume_encrypted = ws.get("RootVolumeEncryptionEnabled", "")
+                user_volume_encrypted = ws.get("UserVolumeEncryptionEnabled", "")
+                running_mode = ws.get("WorkspaceProperties", {}).get("RunningMode", "")
+                running_mode_auto_stop = ws.get("WorkspaceProperties", {}).get("RunningModeAutoStopTimeoutInMinutes", "")
+                compute_type = ws.get("WorkspaceProperties", {}).get("ComputeTypeName", "")
+                root_volume_size = ws.get("WorkspaceProperties", {}).get("RootVolumeSizeGib", "")
+                user_volume_size = ws.get("WorkspaceProperties", {}).get("UserVolumeSizeGib", "")
+
+                # Collect tags
+                try:
+                    tag_response = client.describe_tags(ResourceId=workspace_id)
+                    tags = {t["Key"]: t["Value"] for t in tag_response.get("TagList", []) if t["Key"] in required_tags}
+                except botocore.exceptions.ClientError:
+                    tags = {}
+
+                row = {
+                    "Service": "WorkSpaces",
+                    "Account": account_id,
+                    "Region": region,
+                    "WorkspaceId": workspace_id,
+                    "DirectoryId": directory_id,
+                    "UserName": user_name,
+                    "BundleId": bundle_id,
+                    "State": state,
+                    "ComputerName": computer_name,
+                    "IpAddress": ip_address,
+                    "SubnetId": subnet_id,
+                    "ComputeType": compute_type,
+                    "RunningMode": running_mode,
+                    "AutoStopTimeout": running_mode_auto_stop,
+                    "RootVolumeSizeGiB": root_volume_size,
+                    "UserVolumeSizeGiB": user_volume_size,
+                    "RootVolumeEncrypted": root_volume_encrypted,
+                        "UserVolumeEncrypted": user_volume_encrypted,
+                    "KMSKey": volume_encryption,
+                    **{tag: tags.get(tag, "") for tag in required_tags}
+                }
+
+                rows.append(row)
+        except botocore.exceptions.ClientError as e:
+            if "AccessDenied" not in str(e):
+                print(f"[ERROR] WorkSpaces collection failed in {region} for {account_id}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected WorkSpaces processing error for {account_id}/{region}: {e}")
+
+        print(f"[DONE] WorkSpaces collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] WorkSpaces collection failed in {region} for {account_id}: {e}")
+        return []
+#---------------------------------------Redis (ElastiCache)--------------------------------
+# ----------------- Redis (ElastiCache) -----------------
+def collect_redis(session, region, account_id):
+    """
+    Collect Redis (ElastiCache) cluster and replication group details.
+    Includes endpoints, engine version, VPC, subnet group, SGs, and tags.
+    Fully read-only.
+    """
+    print(f"[START] Redis (ElastiCache) collection for {account_id}/{region}")
+    try:
+        client = session.client("elasticache", region_name=region)
+        ec2_client = session.client("ec2", region_name=region)
+
+        # Describe replication groups and clusters
+        rep_groups = client.describe_replication_groups().get("ReplicationGroups", [])
+        clusters = client.describe_cache_clusters(ShowCacheNodeInfo=True).get("CacheClusters", [])
+
+        # Describe Subnets and VPCs for mapping
+        subnet_groups_resp = client.describe_cache_subnet_groups().get("CacheSubnetGroups", [])
+        vpc_map = {}
+        subnet_group_map = {}
+        for s in subnet_groups_resp:
+            subnet_group_map[s["CacheSubnetGroupName"]] = {
+                "VpcId": s.get("VpcId", ""),
+                "Subnets": [sn["SubnetIdentifier"] for sn in s.get("Subnets", [])],
+                "SubnetGroupDescription": s.get("CacheSubnetGroupDescription", "")
+            }
+            vpc_map[s["VpcId"]] = ""
+
+        # Map VPC IDs to Names
+        if vpc_map:
+            vpc_resp = ec2_client.describe_vpcs(VpcIds=list(vpc_map.keys()))
+            for v in vpc_resp.get("Vpcs", []):
+                tags = {t["Key"]: t["Value"] for t in v.get("Tags", [])}
+                vpc_map[v["VpcId"]] = tags.get("Name", "")
+
+        rows = []
+
+        for cluster in clusters:
+            cluster_id = cluster.get("CacheClusterId", "")
+            engine = cluster.get("Engine", "")
+            engine_version = cluster.get("EngineVersion", "")
+            node_type = cluster.get("CacheNodeType", "")
+            num_nodes = cluster.get("NumCacheNodes", 0)
+            status = cluster.get("CacheClusterStatus", "")
+            replication_group_id = cluster.get("ReplicationGroupId", "")
+            subnet_group_name = cluster.get("CacheSubnetGroupName", "")
+            security_groups = [sg["SecurityGroupId"] for sg in cluster.get("SecurityGroups", [])]
+            azs = [node.get("CustomerAvailabilityZone", "") for node in cluster.get("CacheNodes", [])]
+            primary_endpoint = cluster.get("ConfigurationEndpoint", {}).get("Address", "")
+            port = cluster.get("ConfigurationEndpoint", {}).get("Port", "")
+
+            # Tags
+            tags = {}
+            try:
+                arn = cluster.get("ARN", "")
+                if arn:
+                    tag_list = client.list_tags_for_resource(ResourceName=arn).get("TagList", [])
+                    tags = {t["Key"]: t["Value"] for t in tag_list if t["Key"] in required_tags}
+            except Exception:
+                pass
+
+            # Subnet & VPC Info
+            subnet_group_info = subnet_group_map.get(subnet_group_name, {})
+            vpc_id = subnet_group_info.get("VpcId", "")
+            vpc_name = vpc_map.get(vpc_id, "")
+            subnet_list = subnet_group_info.get("Subnets", [])
+
+            row = {
+                "Service": "Redis",
+                "Account": account_id,
+                "Region": region,
+                "ClusterId": cluster_id,
+                "ReplicationGroupId": replication_group_id,
+                "Engine": engine,
+                "EngineVersion": engine_version,
+                "NodeType": node_type,
+                "NodeCount": num_nodes,
+                "Status": status,
+                "VpcId": vpc_id,
+                "VpcName": vpc_name,
+                "SubnetGroupName": subnet_group_name,
+                "Subnets": "; ".join(subnet_list),
+                "AvailabilityZones": "; ".join(azs),
+                "SecurityGroups": "; ".join(security_groups),
+                "PrimaryEndpoint": f"{primary_endpoint}:{port}" if primary_endpoint else "-",
+                **{t: tags.get(t, "") for t in required_tags},
+            }
+
+            rows.append(row)
+
+        print(f"[DONE] Redis collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] Redis collection failed in {region}: {e}")
+        return []
+
+#--------------------------NAT--------------------------
+# ----------------- NAT Gateways -----------------
+def collect_nat_gateways(session, region, account_id):
+    """
+    Collect NAT Gateway information across all VPCs in a region.
+    Includes Subnet Name, VPC Name, attached IPs, and InUse status.
+    Fully read-only.
+    """
+    print(f"[START] NAT Gateway collection for {account_id}/{region}")
+    try:
+        client = session.client("ec2", region_name=region)
+
+        # Describe NAT Gateways
+        nat_response = client.describe_nat_gateways()
+        nat_gateways = nat_response.get("NatGateways", [])
+
+        # Describe Subnets to map subnetId -> subnetName, vpcId
+        subnet_response = client.describe_subnets()
+        subnet_map = {s["SubnetId"]: {t["Key"]: t["Value"] for t in s.get("Tags", [])} for s in subnet_response.get("Subnets", [])}
+
+        # Describe VPCs to map vpcId -> vpcName
+        vpc_response = client.describe_vpcs()
+        vpc_name_map = {}
+        for v in vpc_response.get("Vpcs", []):
+            vpc_tags = {t["Key"]: t["Value"] for t in v.get("Tags", [])}
+            vpc_name_map[v["VpcId"]] = vpc_tags.get("Name", "")
+
+        rows = []
+
+        for nat in nat_gateways:
+            nat_id = nat["NatGatewayId"]
+            vpc_id = nat.get("VpcId", "")
+            subnet_id = nat.get("SubnetId", "")
+            state = nat.get("State", "")
+            tags = {t["Key"]: t["Value"] for t in nat.get("Tags", []) if t["Key"] in required_tags}
+
+            # NAT Name
+            nat_name = ""
+            for t in nat.get("Tags", []):
+                if t["Key"] == "Name":
+                    nat_name = t["Value"]
+
+            # Subnet and VPC Names
+            subnet_name = subnet_map.get(subnet_id, {}).get("Name", "")
+            vpc_name = vpc_name_map.get(vpc_id, "")
+
+            # IP details
+            public_ips = []
+            private_ips = []
+            elastic_ips = []
+
+            for addr in nat.get("NatGatewayAddresses", []):
+                if addr.get("PublicIp"):
+                    public_ips.append(addr["PublicIp"])
+                if addr.get("PrivateIp"):
+                    private_ips.append(addr["PrivateIp"])
+                if addr.get("AllocationId"):
+                    elastic_ips.append(addr["AllocationId"])
+
+            in_use = state.lower() == "available"
+
+            row = {
+                "Service": "NATGateway",
+                "Account": account_id,
+                "Region": region,
+                "NatGatewayId": nat_id,
+                "NatGatewayName": nat_name,
+                "VpcId": vpc_id,
+                "VpcName": vpc_name,
+                "SubnetId": subnet_id,
+                "SubnetName": subnet_name,
+                "State": state,
+                "InUse": in_use,
+                "PublicIPs": "; ".join(public_ips) if public_ips else "-",
+                "PrivateIPs": "; ".join(private_ips) if private_ips else "-",
+                "ElasticIPs": "; ".join(elastic_ips) if elastic_ips else "-",
+                **{t: tags.get(t, "") for t in required_tags},
+            }
+
+            rows.append(row)
+
+        print(f"[DONE] NAT Gateway collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] NAT Gateway collection failed in {region}: {e}")
+        return []
+#-----------------------------Dyanmo DB-----------------------------
+# ----------------- DynamoDB -----------------
+def collect_dynamodb(session, region, account_id):
+    """
+    Collect DynamoDB table details for a given account and region.
+    Includes throughput, encryption, PITR, and tags.
+    Fully read-only.
+    """
+    print(f"[START] DynamoDB collection for {account_id}/{region}")
+    try:
+        client = session.client("dynamodb", region_name=region)
+
+        # List tables
+        table_names = []
+        paginator = client.get_paginator("list_tables")
+        for page in paginator.paginate():
+            table_names.extend(page.get("TableNames", []))
+
+        rows = []
+
+        for table_name in table_names:
+            try:
+                table_desc = client.describe_table(TableName=table_name)["Table"]
+
+                # Extract main properties
+                table_status = table_desc.get("TableStatus", "")
+                item_count = table_desc.get("ItemCount", 0)
+                size_bytes = table_desc.get("TableSizeBytes", 0)
+                billing_mode = table_desc.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
+
+                read_capacity = table_desc.get("ProvisionedThroughput", {}).get("ReadCapacityUnits", "")
+                write_capacity = table_desc.get("ProvisionedThroughput", {}).get("WriteCapacityUnits", "")
+
+                # Encryption info
+                sse_desc = table_desc.get("SSEDescription", {})
+                encryption_type = sse_desc.get("SSEType", "")
+                kms_key_arn = sse_desc.get("KMSMasterKeyArn", "")
+                sse_status = sse_desc.get("Status", "")
+
+                # PITR (Point-in-time recovery)
+                try:
+                    pitr_resp = client.describe_continuous_backups(TableName=table_name)
+                    pitr_status = pitr_resp["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"].get("PointInTimeRecoveryStatus", "DISABLED")
+                except Exception:
+                    pitr_status = "UNKNOWN"
+
+                # Tags
+                tags = {}
+                try:
+                    arn = table_desc.get("TableArn", "")
+                    if arn:
+                        tag_resp = client.list_tags_of_resource(ResourceArn=arn)
+                        tag_list = tag_resp.get("Tags", [])
+                        tags = {t["Key"]: t["Value"] for t in tag_list if t["Key"] in required_tags}
+                except Exception:
+                    pass
+
+                in_use = table_status.lower() == "active"
+
+                row = {
+                    "Service": "DynamoDB",
+                    "Account": account_id,
+                    "Region": region,
+                    "TableName": table_name,
+                    "Status": table_status,
+                    "InUse": in_use,
+                    "ItemCount": item_count,
+                    "SizeBytes": size_bytes,
+                    "BillingMode": billing_mode,
+                    "ReadCapacityUnits": read_capacity,
+                    "WriteCapacityUnits": write_capacity,
+                    "EncryptionType": encryption_type,
+                    "KMSKeyArn": kms_key_arn,
+                    "SSEStatus": sse_status,
+                    "PITRStatus": pitr_status,
+                    **{t: tags.get(t, "") for t in required_tags},
+                }
+
+                rows.append(row)
+
+            except botocore.exceptions.ClientError as e:
+                print(f"[WARN] Failed to describe DynamoDB table {table_name}: {e}")
+
+        print(f"[DONE] DynamoDB collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] DynamoDB collection failed in {region}: {e}")
+        return []
+#---------------------------------Event Bridge---------------
+def collect_eventbridge(session, region, account_id):
+    """
+    Collect Amazon EventBridge info (Event Buses, Rules, and Targets)
+    with consistent formatting for inventory reporting.
+    """
+    print(f"[START] EventBridge collection for {account_id}/{region}")
+    rows = []
+
+    try:
+        client = session.client("events", region_name=region)
+
+        # ---------- Collect Event Buses ----------
+        try:
+            pages = safe_paginate(client, "list_event_buses")
+            for page in pages:
+                for bus in page.get("EventBuses", []):
+                    bus_name = bus.get("Name", "")
+                    bus_arn = bus.get("Arn", "")
+                    tags = {}
+
+                    # Get tags
+                    try:
+                        tag_resp = client.list_tags_for_resource(ResourceARN=bus_arn)
+                        tags = {t["Key"]: t["Value"] for t in tag_resp.get("Tags", [])}
+                    except Exception:
+                        pass
+
+                    row = {
+                        "Service": "EventBridge",
+                        "Account": account_id,
+                        "Region": region,
+                        "ResourceType": "EventBus",
+                        "BusName": bus_name,
+                        "BusArn": bus_arn,
+                        "Description": bus.get("Description", ""),
+                        "ResourceName": bus_name,
+                        "ResourceId": bus_arn,
+                        "InUse": True,
+                        **{t: tags.get(t, "") for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] EventBridge buses collection failed for {account_id}/{region}: {e}")
+
+        # ---------- Collect Rules per Bus ----------
+        try:
+            buses = [b["Name"] for b in client.list_event_buses().get("EventBuses", [])]
+            for bus_name in buses:
+                rule_pages = safe_paginate(client, "list_rules", EventBusName=bus_name)
+                for rule_page in rule_pages:
+                    for rule in rule_page.get("Rules", []):
+                        rule_name = rule.get("Name", "")
+                        rule_arn = rule.get("Arn", "")
+                        tags = {}
+
+                        # Get tags
+                        try:
+                            tag_resp = client.list_tags_for_resource(ResourceARN=rule_arn)
+                            tags = {t["Key"]: t["Value"] for t in tag_resp.get("Tags", [])}
+                        except Exception:
+                            pass
+
+                        # Get targets
+                        target_names = []
+                        try:
+                            targets = client.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)
+                            target_names = [t.get("Arn", "") for t in targets.get("Targets", [])]
+                        except Exception:
+                            pass
+
+                        row = {
+                            "Service": "EventBridge",
+                            "Account": account_id,
+                            "Region": region,
+                            "ResourceType": "Rule",
+                            "BusName": bus_name,
+                            "RuleName": rule_name,
+                            "RuleArn": rule_arn,
+                            "EventPattern": json.dumps(rule.get("EventPattern", {})),
+                            "State": rule.get("State", ""),
+                            "ScheduleExpression": rule.get("ScheduleExpression", ""),
+                            "Targets": ", ".join(target_names) if target_names else "-",
+                            "ResourceName": rule_name,
+                            "ResourceId": rule_arn,
+                            "InUse": bool(target_names),
+                            **{t: tags.get(t, "") for t in required_tags},
+                        }
+                        rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] EventBridge rules collection failed for {account_id}/{region}: {e}")
+
+        print(f"[DONE] EventBridge collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] EventBridge collection failed in {region} for {account_id}: {e}")
+        return []
+    except Exception as e:
+        print(f"[ERROR] Unexpected EventBridge processing error for {account_id}/{region}: {e}")
+        return []
+
+
+# ------------------------- IAM -------------------------------
+
+def collect_iam(session, region, account_id):
+    """
+    Collect IAM Users, Roles, Groups, and Policies info.
+    Outputs separate columns with tags and logical flags for activity/in-use.
+    """
+    print(f"[START] IAM collection for {account_id}")
+    rows = []
+    try:
+        client = session.client("iam")
+
+        # --- Collect IAM Users ---
+        try:
+            users_pages = safe_paginate(client, "list_users")
+            for users_page in users_pages:
+                for user in users_page.get("Users", []):
+                    user_name = user.get("UserName", "")
+                    arn = user.get("Arn", "")
+                    create_date = str(user.get("CreateDate", ""))
+                    password_last_used = str(user.get("PasswordLastUsed", ""))
+                    tags = {}
+
+                    try:
+                        tag_resp = client.list_user_tags(UserName=user_name)
+                        tags = {t["Key"]: t["Value"] for t in tag_resp.get("Tags", []) if t["Key"] in required_tags}
+                    except Exception:
+                        pass
+
+                    row = {
+                        "Service": "IAM",
+                        "Account": account_id,
+                        "Region": "global",
+                        "Type": "User",
+                        "Name": user_name,
+                        "Arn": arn,
+                        "CreatedDate": create_date,
+                        "PasswordLastUsed": password_last_used,
+                        "InUse": bool(password_last_used and password_last_used != "None"),
+                        "ResourceName": user_name,
+                        "ResourceId": arn,
+                        **{t: tags.get(t, "") for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] IAM User collection failed for {account_id}: {e}")
+
+        # --- Collect IAM Roles ---
+        try:
+            roles_pages = safe_paginate(client, "list_roles")
+            for roles_page in roles_pages:
+                for role in roles_page.get("Roles", []):
+                    role_name = role.get("RoleName", "")
+                    arn = role.get("Arn", "")
+                    create_date = str(role.get("CreateDate", ""))
+                    tags = {}
+
+                    try:
+                        tag_resp = client.list_role_tags(RoleName=role_name)
+                        tags = {t["Key"]: t["Value"] for t in tag_resp.get("Tags", []) if t["Key"] in required_tags}
+                    except Exception:
+                        pass
+
+                    # Determine if the role is actively used
+                    in_use = bool(role.get("RoleLastUsed", {}).get("LastUsedDate"))
+
+                    row = {
+                        "Service": "IAM",
+                        "Account": account_id,
+                        "Region": "global",
+                        "Type": "Role",
+                        "Name": role_name,
+                        "Arn": arn,
+                        "CreatedDate": create_date,
+                        "LastUsedDate": str(role.get("RoleLastUsed", {}).get("LastUsedDate", "")),
+                        "InUse": in_use,
+                        "ResourceName": role_name,
+                        "ResourceId": arn,
+                        **{t: tags.get(t, "") for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] IAM Role collection failed for {account_id}: {e}")
+
+        # --- Collect IAM Groups ---
+        try:
+            groups_pages = safe_paginate(client, "list_groups")
+            for groups_page in groups_pages:
+                for group in groups_page.get("Groups", []):
+                    group_name = group.get("GroupName", "")
+                    arn = group.get("Arn", "")
+                    create_date = str(group.get("CreateDate", ""))
+
+                    row = {
+                        "Service": "IAM",
+                        "Account": account_id,
+                        "Region": "global",
+                        "Type": "Group",
+                        "Name": group_name,
+                        "Arn": arn,
+                        "CreatedDate": create_date,
+                        "InUse": "-",  # Groups have no direct "use" metric
+                        "ResourceName": group_name,
+                        "ResourceId": arn,
+                        **{t: "" for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] IAM Group collection failed for {account_id}: {e}")
+
+        # --- Collect IAM Policies (only customer-managed) ---
+        try:
+            policies_pages = safe_paginate(client, "list_policies", Scope="Local")
+            for policies_page in policies_pages:
+                for policy in policies_page.get("Policies", []):
+                    policy_name = policy.get("PolicyName", "")
+                    arn = policy.get("Arn", "")
+                    create_date = str(policy.get("CreateDate", ""))
+
+                    row = {
+                        "Service": "IAM",
+                        "Account": account_id,
+                        "Region": "global",
+                        "Type": "Policy",
+                        "Name": policy_name,
+                        "Arn": arn,
+                        "CreatedDate": create_date,
+                        "InUse": "-",  # You could extend this with policy attachment info if needed
+                        "ResourceName": policy_name,
+                        "ResourceId": arn,
+                        **{t: "" for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] IAM Policy collection failed for {account_id}: {e}")
+
+        print(f"[DONE] IAM collection for {account_id} - {len(rows)} records")
+
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] IAM client creation failed for {account_id}: {e}")
+        return []
+    except Exception as e:
+        print(f"[ERROR] Unexpected IAM processing error for {account_id}: {e}")
+        return []
+# ------------------------- API Gateway -------------------------------
+def collect_apigateway(session, region, account_id):
+    """
+    Collect API Gateway (REST, HTTP, WebSocket) info.
+    Includes API details, stages, and tags with consistent output format.
+    """
+    print(f"[START] API Gateway collection for {account_id}/{region}")
+    rows = []
+
+    try:
+        # ---------- API Gateway v1 (REST APIs) ----------
+        try:
+            client_v1 = session.client("apigateway", region_name=region)
+            pages_v1 = safe_paginate(client_v1, "get_rest_apis")
+
+            for page in pages_v1:
+                for api in page.get("items", []):
+                    api_id = api.get("id", "")
+                    api_name = api.get("name", "")
+                    description = api.get("description", "")
+                    created_date = str(api.get("createdDate", ""))
+                    endpoint_conf = json.dumps(api.get("endpointConfiguration", {}))
+                    tags = {}
+                    stage_names = []
+
+                    # Tags
+                    try:
+                        tag_resp = client_v1.get_tags(resourceArn=f"arn:aws:apigateway:{region}::/restapis/{api_id}")
+                        tags = tag_resp.get("tags", {})
+                    except Exception:
+                        pass
+
+                    # Stages
+                    try:
+                        stage_resp = client_v1.get_stages(restApiId=api_id)
+                        stage_names = [s.get("stageName", "") for s in stage_resp.get("item", [])]
+                    except Exception:
+                        pass
+
+                    row = {
+                        "Service": "API Gateway",
+                        "Account": account_id,
+                        "Region": region,
+                        "Type": "REST",
+                        "APIName": api_name,
+                        "APIId": api_id,
+                        "Description": description,
+                        "CreatedDate": created_date,
+                        "Stages": ", ".join(stage_names) if stage_names else "-",
+                        "EndpointConfiguration": endpoint_conf,
+                        "InUse": bool(stage_names),
+                        "ResourceName": api_name,
+                        "ResourceId": api_id,
+                        **{t: tags.get(t, "") for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] API Gateway v1 (REST) collection failed for {account_id}/{region}: {e}")
+
+        # ---------- API Gateway v2 (HTTP / WebSocket APIs) ----------
+        try:
+            client_v2 = session.client("apigatewayv2", region_name=region)
+            pages_v2 = safe_paginate(client_v2, "get_apis")
+
+            for page in pages_v2:
+                for api in page.get("Items", []):
+                    api_id = api.get("ApiId", "")
+                    api_name = api.get("Name", "")
+                    description = api.get("Description", "")
+                    protocol = api.get("ProtocolType", "")
+                    version = api.get("Version", "")
+                    route_expr = api.get("RouteSelectionExpression", "")
+                    created_date = str(api.get("CreatedDate", ""))
+                    tags = {}
+                    stage_names = []
+
+                    # Tags
+                    try:
+                        tag_resp = client_v2.get_tags(ResourceArn=f"arn:aws:apigateway:{region}::/apis/{api_id}")
+                        tags = tag_resp.get("Tags", {})
+                    except Exception:
+                        pass
+
+                    # Stages
+                    try:
+                        stage_resp = client_v2.get_stages(ApiId=api_id)
+                        stage_names = [s.get("StageName", "") for s in stage_resp.get("Items", [])]
+                    except Exception:
+                        pass
+
+                    row = {
+                        "Service": "API Gateway",
+                        "Account": account_id,
+                        "Region": region,
+                        "Type": protocol,
+                        "APIName": api_name,
+                        "APIId": api_id,
+                        "Description": description,
+                        "Version": version,
+                        "RouteSelectionExpression": route_expr,
+                        "CreatedDate": created_date,
+                        "Stages": "; ".join(stage_names) if stage_names else "-",
+                        "InUse": bool(stage_names),
+                        "ResourceName": api_name,
+                        "ResourceId": api_id,
+                        **{t: tags.get(t, "") for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] API Gateway v2 (HTTP/WebSocket) collection failed for {account_id}/{region}: {e}")
+
+        print(f"[DONE] API Gateway collection for {account_id}/{region} - {len(rows)} records")
+
+        return rows
+
+    except botocore.exceptions.ClientError as e:
+        print(f"[ERROR] API Gateway collection failed in {region} for {account_id}: {e}")
+        return []
+    except Exception as e:
+        print(f"[ERROR] Unexpected API Gateway processing error for {account_id}/{region}: {e}")
+        return []
+
+#--------------------------OpenSearch-----------
+def collect_opensearch(session, region, account_id):
+    """
+    Collect Amazon OpenSearch/Elasticsearch domain details.
+    Includes configuration, endpoints, VPC info, and tags.
+    """
+    print(f"[START] OpenSearch collection for {account_id}/{region}")
+    rows = []
+
+    try:
+        # Try OpenSearch client first, fallback to Elasticsearch
+        try:
+            client = session.client("opensearch", region_name=region)
+            domains_resp = client.list_domain_names()
+        except Exception:
+            client = session.client("es", region_name=region)
+            domains_resp = client.list_domain_names()
+
+        domain_names = [d["DomainName"] for d in domains_resp.get("DomainNames", [])]
+
+        for domain_name in domain_names:
+            try:
+                desc = client.describe_domain(DomainName=domain_name)
+                domain_status = desc.get("DomainStatus", {})
+                arn = domain_status.get("ARN", "")
+                tags = {}
+
+                # Tags
+                try:
+                    tag_resp = client.list_tags(ARN=arn)
+                    tags = {t["Key"]: t["Value"] for t in tag_resp.get("TagList", [])}
+                except Exception:
+                    pass
+
+                vpc_info = domain_status.get("VPCOptions", {})
+                vpc_id = vpc_info.get("VPCId", "")
+                subnet_ids = "; ".join(vpc_info.get("SubnetIds", [])) if vpc_info.get("SubnetIds") else ""
+                security_groups = "; ".join(vpc_info.get("SecurityGroupIds", [])) if vpc_info.get("SecurityGroupIds") else ""
+
+                cluster_config = domain_status.get("ClusterConfig", {})
+                instance_type = cluster_config.get("InstanceType", "")
+                instance_count = cluster_config.get("InstanceCount", "")
+                dedicated_master_enabled = cluster_config.get("DedicatedMasterEnabled", False)
+                dedicated_master_type = cluster_config.get("DedicatedMasterType", "")
+                dedicated_master_count = cluster_config.get("DedicatedMasterCount", "")
+
+                encryption = domain_status.get("EncryptionAtRestOptions", {}).get("Enabled", False)
+                node_to_node_encryption = domain_status.get("NodeToNodeEncryptionOptions", {}).get("Enabled", False)
+
+                endpoint = domain_status.get("Endpoint", "")
+                endpoints = domain_status.get("Endpoints", {})
+
+                row = {
+                    "Service": "OpenSearch",
+                    "Account": account_id,
+                    "Region": region,
+                    "DomainName": domain_name,
+                    "DomainId": domain_status.get("DomainId", ""),
+                    "ARN": arn,
+                    "EngineVersion": domain_status.get("EngineVersion", ""),
+                    "VPCId": vpc_id,
+                    "SubnetIds": subnet_ids,
+                    "SecurityGroups": security_groups,
+                    "InstanceType": instance_type,
+                    "InstanceCount": instance_count,
+                    "DedicatedMasterEnabled": dedicated_master_enabled,
+                    "DedicatedMasterType": dedicated_master_type,
+                    "DedicatedMasterCount": dedicated_master_count,
+                    "EncryptionAtRestEnabled": encryption,
+                    "NodeToNodeEncryptionEnabled": node_to_node_encryption,
+                    "Endpoint": endpoint,
+                    "AlternateEndpoints": json.dumps(endpoints),
+                    "Processing": domain_status.get("Processing", False),
+                    "Created": domain_status.get("Created", ""),
+                    "Deleted": domain_status.get("Deleted", ""),
+                    "InUse": not domain_status.get("Deleted", False),
+                    "ResourceName": domain_name,
+                    "ResourceId": arn,
+                    **{t: tags.get(t, "") for t in required_tags},
+                }
+                rows.append(row)
+            except Exception as e:
+                print(f"[ERROR] Describe failed for domain {domain_name}: {e}")
+
+        print(f"[DONE] OpenSearch collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except Exception as e:
+        print(f"[ERROR] OpenSearch collection failed for {account_id}/{region}: {e}")
+        return []
+#--------------------AppSync not supported in
+def collect_appsync(session, region, account_id):
+    """
+    Collect AWS AppSync GraphQL API details.
+    Includes endpoints, auth types, logging config, and tags.
+    """
+    supported_appsync_regions = [
+        "us-east-1", "us-west-2", "eu-west-1", "eu-west-2",
+        "ap-northeast-1", "ap-south-1", "ap-southeast-1"
+    ]
+    if region not in supported_appsync_regions:
+        print(f"[SKIP] AppSync not supported in {region}")
+        return []
+
+    print(f"[START] AppSync collection for {account_id}/{region}")
+    rows = []
+
+    try:
+        client = session.client("appsync", region_name=region)
+        paginator = client.get_paginator("list_graphql_apis")
+
+        for page in paginator.paginate():
+            for api in page.get("graphqlApis", []):
+                api_id = api.get("apiId")
+                arn = api.get("arn")
+                name = api.get("name")
+                auth_type = api.get("authenticationType")
+                uris = api.get("uris", {})
+                log_config = api.get("logConfig", {})
+                xray_enabled = api.get("xrayEnabled", False)
+                additional_auth_types = api.get("additionalAuthenticationProviders", [])
+                visibility = api.get("visibility", "PRIVATE")
+
+                # Tags
+                tags = {}
+                try:
+                    tag_resp = client.list_tags_for_resource(resourceArn=arn)
+                    tags = tag_resp.get("tags", {})
+                except Exception:
+                    pass
+
+                # Data sources
+                data_sources = []
+                try:
+                    ds_paginator = client.get_paginator("list_data_sources")
+                    for ds_page in ds_paginator.paginate(apiId=api_id):
+                        data_sources.extend([ds.get("name") for ds in ds_page.get("dataSources", [])])
+                except Exception:
+                    pass
+
+                # Resolver count
+                resolver_count = 0
+                try:
+                    types_resp = client.list_types(apiId=api_id, format="SDL")
+                    for t in types_resp.get("types", []):
+                        type_name = t.get("name")
+                        res_paginator = client.get_paginator("list_resolvers")
+                        for res_page in res_paginator.paginate(apiId=api_id, typeName=type_name):
+                            resolver_count += len(res_page.get("resolvers", []))
+                except Exception:
+                    pass
+
+                row = {
+                    "Service": "AppSync",
+                    "Account": account_id,
+                    "Region": region,
+                    "APIName": name,
+                    "APIId": api_id,
+                    "ARN": arn,
+                    "AuthenticationType": auth_type,
+                    "AdditionalAuthTypes": json.dumps(additional_auth_types),
+                    "Visibility": visibility,
+                    "XRayEnabled": xray_enabled,
+                    "Uris": json.dumps(uris),
+                    "LogConfig": json.dumps(log_config),
+                    "DataSources": "; ".join(data_sources),
+                    "ResolverCount": resolver_count,
+                    "Created": str(api.get("creationDate", "")),
+                    "Modified": str(api.get("lastModifiedDate", "")),
+                    "ResourceName": name,
+                    "ResourceId": arn,
+                    **{t: tags.get(t, "") for t in required_tags},
+                }
+                rows.append(row)
+
+        print(f"[DONE] AppSync collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except Exception as e:
+        print(f"[ERROR] AppSync collection failed in {region} for {account_id}: {e}")
+        return []
+#----------------------------------------SES (Mail Service) collection
+def collect_mail_service(session, region, account_id):
+    """
+    Collect Amazon Simple Email Service (SES) details.
+    Includes identities, configuration sets, DKIM, and quotas.
+    """
+    supported_ses_regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-south-1"]
+    if region not in supported_ses_regions:
+        print(f"[SKIP] SES not supported in {region}")
+        return []
+
+    print(f"[START] SES (Mail Service) collection for {account_id}/{region}")
+    rows = []
+
+    try:
+        # Try SESv2 first, fallback to SESv1
+        try:
+            client = session.client("sesv2", region_name=region)
+            paginator = client.get_paginator("list_email_identities")
+            v2 = True
+        except Exception:
+            client = session.client("ses", region_name=region)
+            v2 = False
+
+        # Quota
+        try:
+            quota_resp = client.get_sending_quota() if not v2 else {}
+            max_24_hour_send = quota_resp.get("Max24HourSend", 0)
+            max_send_rate = quota_resp.get("MaxSendRate", 0)
+            sent_last_24_hours = quota_resp.get("SentLast24Hours", 0)
+        except Exception:
+            max_24_hour_send = max_send_rate = sent_last_24_hours = "N/A"
+
+        # Config sets
+        config_sets = []
+        try:
+            paginator_conf = client.get_paginator("list_configuration_sets")
+            for page in paginator_conf.paginate():
+                config_sets.extend(page.get("ConfigurationSets", []))
+        except Exception:
+            pass
+
+        # Identities
+        try:
+            if v2:
+                paginator = client.get_paginator("list_email_identities")
+                for page in paginator.paginate():
+                    for ident in page.get("EmailIdentities", []):
+                        name = ident.get("IdentityName")
+                        arn = ident.get("IdentityArn", "")
+                        tags = {}
+                        try:
+                            tag_resp = client.list_tags_for_resource(ResourceArn=arn)
+                            tags = {t["Key"]: t["Value"] for t in tag_resp.get("Tags", [])}
+                        except Exception:
+                            pass
+
+                        row = {
+                            "Service": "SES",
+                            "Account": account_id,
+                            "Region": region,
+                            "IdentityName": name,
+                            "IdentityType": ident.get("IdentityType", ""),
+                            "Verified": ident.get("VerifiedForSendingStatus", False),
+                            "DkimStatus": ident.get("DkimAttributes", {}).get("Status", ""),
+                            "MailFromDomain": ident.get("MailFromAttributes", {}).get("MailFromDomain", ""),
+                            "MailFromStatus": ident.get("MailFromAttributes", {}).get("BehaviorOnMxFailure", ""),
+                            "SendingEnabled": ident.get("SendingEnabled", ""),
+                            "Max24HourSend": max_24_hour_send,
+                            "MaxSendRate": max_send_rate,
+                            "SentLast24Hours": sent_last_24_hours,
+                            "ConfigurationSets": "; ".join(config_sets),
+                            "ResourceName": name,
+                            "ResourceId": arn,
+                            **{t: tags.get(t, "") for t in required_tags},
+                        }
+                        rows.append(row)
+            else:
+                identities = client.list_identities().get("Identities", [])
+                for name in identities:
+                    row = {
+                        "Service": "SES",
+                        "Account": account_id,
+                        "Region": region,
+                        "IdentityName": name,
+                        "ResourceName": name,
+                        "ResourceId": name,
+                        "Max24HourSend": max_24_hour_send,
+                        "MaxSendRate": max_send_rate,
+                        "SentLast24Hours": sent_last_24_hours,
+                        **{t: "" for t in required_tags},
+                    }
+                    rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] SES identity listing failed: {e}")
+
+        print(f"[DONE] SES (Mail Service) collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except Exception as e:
+        print(f"[ERROR] SES (Mail Service) error for {account_id}/{region}: {e}")
+        return []
+
+#------------------AmazonMQ-------------------
+def collect_amazon_mq(session, region, account_id):
+    """
+    Collect Amazon MQ broker details including configurations, engine type, version, users, and tags.
+    """
+    mq_regions = ["us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-south-1", "ap-southeast-1", "ap-southeast-2"]
+    if region not in mq_regions:
+        print(f"[SKIP] Amazon MQ not supported in {region}")
+        return []
+
+    print(f"[START] Amazon MQ collection for {account_id}/{region}")
+    rows = []
+
+    try:
+        client = session.client("mq", region_name=region)
+        paginator = client.get_paginator("list_brokers")
+
+        for page in paginator.paginate():
+            for broker in page.get("BrokerSummaries", []):
+                broker_id = broker.get("BrokerId")
+                broker_name = broker.get("BrokerName")
+                broker_arn = broker.get("BrokerArn")
+
+                try:
+                    details = client.describe_broker(BrokerId=broker_id)
+                except Exception:
+                    details = {}
+
+                tags = {}
+                try:
+                    tag_resp = client.list_tags(ResourceArn=broker_arn)
+                    tags = {k: v for k, v in tag_resp.get("Tags", {}).items()}
+                except Exception:
+                    pass
+
+                users_list = []
+                try:
+                    users_resp = client.list_users(BrokerId=broker_id)
+                    users_list = [u["Username"] for u in users_resp.get("Users", [])]
+                except Exception:
+                    pass
+
+                row = {
+                    "Service": "AmazonMQ",
+                    "Account": account_id,
+                    "Region": region,
+                    "BrokerId": broker_id,
+                    "BrokerName": broker_name,
+                    "BrokerArn": broker_arn,
+                    "EngineType": broker.get("EngineType", ""),
+                    "EngineVersion": broker.get("EngineVersion", ""),
+                    "DeploymentMode": broker.get("DeploymentMode", ""),
+                    "HostInstanceType": details.get("HostInstanceType", ""),
+                    "StorageType": details.get("StorageType", ""),
+                    "EncryptionOptions": json.dumps(details.get("EncryptionOptions", {})),
+                    "PubliclyAccessible": details.get("PubliclyAccessible", False),
+                    "AutoMinorVersionUpgrade": details.get("AutoMinorVersionUpgrade", False),
+                    "Users": ", ".join(users_list),
+                    "Configurations": json.dumps(details.get("Configurations", {})),
+                    "Endpoints": ", ".join(details.get("Endpoints", [])) if details.get("Endpoints") else "",
+                    "Logs": json.dumps(details.get("Logs", {})),
+                    "Status": broker.get("BrokerState", ""),
+                    "Created": str(details.get("Created", "")),
+                    "ResourceName": broker_name,
+                    "ResourceId": broker_id,
+                    **{t: tags.get(t, "") for t in required_tags},
+                }
+                rows.append(row)
+
+        print(f"[DONE] Amazon MQ collection for {account_id}/{region} - {len(rows)} records")
+        return rows
+
+    except Exception as e:
+        print(f"[ERROR] Amazon MQ collection failed for {account_id}/{region}: {e}")
+        return []
+
+#---------
+
+
+
+
+# ----------------- Parallel Wrapper -----------------
+def collect_service_parallel(session, account_id, region, service_func):
+    return service_func(session, region, account_id)
+
+# ----------------- Main with single file -----------------
+def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"aws_inventory_{timestamp}.xlsx"
+
+    # Combined storage for all accounts
+    service_list = ["EC2", "EBS", "RDS", "S3", "Lambda", "ELB", "ALB", "EFS", "EKS", "EBS Snapshot", "AMI", "VPC", "Subnet", "InternetGateway", "ElasticIP", "SecurityGroup", "WorkSpaces", "Redis", "NATGateway", "DynamoDB", "EventBridge", "IAM","API Gateway", "OpenSearch", "AppSync", "SES", "AmazonMQ"]
+    combined_services = {svc: [] for svc in service_list}
+
+    for account_id, role in account_roles.items():
+        print(f"\n🔹 Assuming role {role} in account {account_id} ...")
+        session = assume_role(account_id, role)
+
+        # get all regions for this account/partition
+        regions = get_all_regions(session)
+        if not regions:
+            print(f"[WARN] No regions returned for account {account_id}, using us-east-1 fallback")
+            regions = ["us-east-1"]
+
+        all_services = {svc: [] for svc in service_list}
+
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            futures = []
+
+            for region in regions:
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_ec2))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_ebs))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_rds))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_lambda))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_elb))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_alb))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_efs))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_eks))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_ebs_snapshots))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_amis))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_vpcs))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_subnets))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_internet_gateways))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_eips))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_security_groups))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_workspaces))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_redis))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_nat_gateways))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_dynamodb))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_eventbridge))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_apigateway))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_opensearch))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_appsync))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_mail_service))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_amazon_mq))
+            # S3 is global
+            futures.append(executor.submit(collect_service_parallel, session, account_id, None, collect_s3))
+            futures.append(executor.submit(collect_service_parallel, session, account_id, None, collect_iam))
+
+            for future in as_completed(futures):
+                try:
+                    data = future.result()
+                    if data:
+                        service_name = data[0]["Service"]
+                        if service_name in all_services:
+                            all_services[service_name].extend(data)
+                        else:
+                            # safety: append to a generic bucket if unexpected
+                            combined_services.setdefault(service_name, []).extend(data)
+                except Exception as e:
+                    print(f"[ERROR] Thread failed for account {account_id}: {e}")
+
+        # Merge per-account results into combined_services
+        for service_name, data in all_services.items():
+            combined_services[service_name].extend(data)
+
+    # Write all accounts into single Excel
+    with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
+        for service_name, data in combined_services.items():
+            if data:
+                pd.DataFrame(data).to_excel(writer, sheet_name=service_name[:31], index=False)
+            else:
+                pd.DataFrame([{"Info": f"No records found for {service_name}"}]).to_excel(writer, sheet_name=service_name[:31], index=False)
+
+    print(f"\n✅ Inventory saved to {filename}")
+
+if __name__ == "__main__":
+    main()
+
+"""
+# ----------------- Main with multpile CSV-----------------
+def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"aws_inventory_{timestamp}.xlsx"
+
+    # Combined storage for all accounts
+    service_list = ["EC2", "EBS", "RDS", "S3", "Lambda", "ELB", "ALB", "EFS", "EKS",
+                    "EBS Snapshot", "AMI", "VPC", "Subnet", "InternetGateway", "ElasticIP",
+                    "SecurityGroup", "WorkSpaces", "Redis", "NATGateway", "DynamoDB",
+                    "EventBridge", "IAM", "API Gateway", "OpenSearch", "AppSync",
+                    "SES", "AmazonMQ"]
+    combined_services = {svc: [] for svc in service_list}
+
+    for account_id, role in account_roles.items():
+        print(f"\n🔹 Assuming role {role} in account {account_id} ...")
+        session = assume_role(account_id, role)
+
+        # get all regions for this account/partition
+        regions = get_all_regions(session)
+        if not regions:
+            print(f"[WARN] No regions returned for account {account_id}, using us-east-1 fallback")
+            regions = ["us-east-1"]
+
+        all_services = {svc: [] for svc in service_list}
+
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            futures = []
+
+            for region in regions:
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_ec2))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_ebs))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_rds))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_lambda))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_elb))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_alb))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_efs))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_eks))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_ebs_snapshots))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_amis))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_vpcs))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_subnets))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_internet_gateways))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_eips))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_security_groups))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_workspaces))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_redis))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_nat_gateways))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_dynamodb))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_eventbridge))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_apigateway))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_opensearch))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_appsync))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_mail_service))
+                futures.append(executor.submit(collect_service_parallel, session, account_id, region, collect_amazon_mq))
+            # S3 is global
+            futures.append(executor.submit(collect_service_parallel, session, account_id, None, collect_s3))
+            futures.append(executor.submit(collect_service_parallel, session, account_id, None, collect_iam))
+
+            for future in as_completed(futures):
+                try:
+                    data = future.result()
+                    if data:
+                        service_name = data[0]["Service"]
+                        if service_name in all_services:
+                            all_services[service_name].extend(data)
+                        else:
+                            # safety: append to a generic bucket if unexpected
+                            combined_services.setdefault(service_name, []).extend(data)
+                except Exception as e:
+                    print(f"[ERROR] Thread failed for account {account_id}: {e}")
+
+        # Merge per-account results into combined_services
+        for service_name, data in all_services.items():
+            combined_services[service_name].extend(data)
+
+    # Write all accounts into single Excel
+    with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
+        for service_name, data in combined_services.items():
+            if data:
+                pd.DataFrame(data).to_excel(writer, sheet_name=service_name[:31], index=False)
+            else:
+                pd.DataFrame([{"Info": f"No records found for {service_name}"}]).to_excel(writer, sheet_name=service_name[:31], index=False)
+
+    print(f"\n✅ Inventory saved to {filename}")
+
+    # ----------------- NEW: Export each service to CSV -----------------
+    output_dir = "aws_csv_exports_{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    for service_name, data in combined_services.items():
+        safe_service_name = service_name.replace(" ", "_")
+        csv_filename = os.path.join(output_dir, f"aws_inventory_{safe_service_name}_{timestamp}.csv")
+
+        if data:
+            pd.DataFrame(data).to_csv(csv_filename, index=False)
+        else:
+            pd.DataFrame([{"Info": f"No records found for {service_name}"}]).to_csv(csv_filename, index=False)
+
+    print(f"✅ Individual CSV files created under: {output_dir}")
+"""
+
+if __name__ == "__main__":
+    main()
